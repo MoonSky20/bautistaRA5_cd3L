@@ -642,7 +642,6 @@ int main(int argc, char *argv[])
 
         int cli = accept(srv, NULL, NULL);
         tune_socket(cli);
-        clock_gettime(CLOCK_MONOTONIC, &t0);
 
         /*
          * KEY FIX: discover our own routable IP from the accepted socket.
@@ -675,6 +674,9 @@ int main(int argc, char *argv[])
         }
         close(cli);
         close(srv);
+
+        /* time_before: all of X has been received, computation is about to begin */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
 
         if (n < 15)
         {
@@ -710,6 +712,12 @@ int main(int argc, char *argv[])
             print_matrix_d(assembled, hdr.num_rows, n, lbl);
         }
 
+        /* time_after: T is fully computed, before sending back to master */
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        printf("SLAVE %d: done. local_rows=%d subtree [%d..%d] time=%f\n",
+               rank, local_rows, hdr.tree_start, hdr.tree_end,
+               (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+
         /*
          * Reply to whoever sent us work: hdr.parent_ip + hdr.reply_port.
          * This is the actual routable IP of our parent node, not ip[0].
@@ -718,11 +726,6 @@ int main(int argc, char *argv[])
                rank, hdr.num_rows, hdr.parent_ip, hdr.reply_port);
         send_result(hdr.parent_ip, hdr.reply_port,
                     assembled, hdr.num_rows, n);
-
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        printf("SLAVE %d: done. local_rows=%d subtree [%d..%d] time=%f\n",
-               rank, local_rows, hdr.tree_start, hdr.tree_end,
-               (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
 
         free(assembled);
         free(data);
