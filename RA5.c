@@ -10,7 +10,6 @@
 #include <pthread.h>
 #include <netinet/tcp.h>
 #include <sys/uio.h>
-#include <sys/epoll.h>
 #include <sched.h>
 
 #define MAX_NODES 17
@@ -19,34 +18,24 @@
 /* ------------------------------------------------------------------ */
 /*  Wire headers                                                        */
 /* ------------------------------------------------------------------ */
-
-/*
- * FIX 1: added parent_ip so every slave knows exactly which HOST to
- *         send its result back to (not just which port).  Previously
- *         every slave hard-coded ip[0] (master) which broke any
- *         intermediate node in the binary tree.
- */
 typedef struct
 {
-    int num_rows;       /* rows in this chunk                      */
-    int tree_start;     /* lower bound of this sub-tree            */
-    int tree_end;       /* upper bound of this sub-tree            */
-    int reply_port;     /* port the PARENT is listening on         */
-    int global_min;     /* global min across the full matrix       */
-    int global_max;     /* global max across the full matrix       */
-    char parent_ip[64]; /* IP of the node that sent this chunk     */
+    int num_rows;   /* rows in this chunk                          */
+    int tree_start; /* lower bound of this sub-tree                */
+    int tree_end;   /* upper bound of this sub-tree                */
+    int reply_port; /* ephemeral port the PARENT is listening on   */
+    int global_min;
+    int global_max;
+    char parent_ip[64]; /* routable IP of the node that sent this      */
 } header_t;
 
-/*
- * Sent upward (child → parent) together with the double result rows.
- */
 typedef struct
 {
-    int num_rows; /* rows being returned                     */
+    int num_rows;
 } result_header_t;
 
 /* ------------------------------------------------------------------ */
-/*  Scatter job                                                         */
+/*  Scatter job (passed to send thread)                                 */
 /* ------------------------------------------------------------------ */
 typedef struct
 {
@@ -61,17 +50,12 @@ typedef struct
     int reply_port;
     int global_min;
     int global_max;
-    char sender_ip[64]; /* FIX 1: our own IP, embedded in header */
+    char sender_ip[64]; /* our own routable IP, embedded in header */
 } send_job_t;
 
 /* ------------------------------------------------------------------ */
-/*  Core affinity helper                                                */
+/*  Core-affinity                                                       */
 /* ------------------------------------------------------------------ */
-/*
- * Pin the calling thread to core (rank % num_cores).
- * This keeps each slave's main thread off the cores used by other
- * slaves on the same machine, reducing cache thrashing and OS jitter.
- */
 static void pin_to_core(int rank)
 {
     int ncores = (int)sysconf(_SC_NPROCESSORS_ONLN);
@@ -114,9 +98,9 @@ static void print_matrix_d(const double *m, int rows, int cols, const char *lbl)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Socket I/O helpers                                                  */
+/*  Socket helpers                                                      */
 /* ------------------------------------------------------------------ */
-static int send_all(int fd, const void *buf, size_t len)
+static int __attribute__((unused)) send_all(int fd, const void *buf, size_t len)
 {
     const char *p = buf;
     while (len)
@@ -151,8 +135,8 @@ static int sendv_all(int fd,
                 continue;
             return -1;
         }
-        total -= n;
-        size_t c = n;
+        total -= (size_t)n;
+        size_t c = (size_t)n;
         for (int i = 0; i < 2 && c; i++)
         {
             if (c >= iov[i].iov_len)
@@ -216,13 +200,14 @@ static int connect_retry(const char *host, int port, int max_tries)
             return fd;
         usleep(100000);
     }
-    fprintf(stderr, "connect_retry: cannot reach %s:%d\n", host, port);
+    fprintf(stderr, "connect_retry: cannot reach %s:%d after %d tries\n",
+            host, port, max_tries);
     exit(1);
 }
 
 /*
- * Open a one-shot TCP listener on an OS-chosen ephemeral port.
- * Returns the listening fd; writes the actual bound port into *port_out.
+ * Bind to an OS-chosen ephemeral port, start listening.
+ * Returns the server fd; writes the bound port into *port_out.
  */
 static int make_listener(int *port_out)
 {
@@ -244,11 +229,31 @@ static int make_listener(int *port_out)
         perror("bind make_listener");
         exit(1);
     }
-    listen(fd, 4);
+    listen(fd, 8);
     socklen_t sl = sizeof(sa);
     getsockname(fd, (struct sockaddr *)&sa, &sl);
     *port_out = ntohs(sa.sin_port);
     return fd;
+}
+
+/*
+ * Discover which local IP the kernel used when the peer connected.
+ * getsockname() on the accepted fd returns the real interface address —
+ * the exact IP the peer (our parent) can reach us on.
+ * We use this instead of ip[rank] from config.txt, which may be
+ * 0.0.0.0, wrong NIC, or an unresolvable hostname.
+ */
+static void local_ip_from_socket(int accepted_fd, char out[64])
+{
+    struct sockaddr_in sa;
+    socklen_t sl = sizeof(sa);
+    if (getsockname(accepted_fd, (struct sockaddr *)&sa, &sl) == 0)
+        inet_ntop(AF_INET, &sa.sin_addr, out, 64);
+    else
+    {
+        perror("getsockname (non-fatal, falling back to 127.0.0.1)");
+        strncpy(out, "127.0.0.1", 64);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -260,17 +265,19 @@ static void send_chunk(int target,
                        char ip[][64], int *ports, int cols,
                        int reply_port,
                        int global_min, int global_max,
-                       const char *sender_ip) /* FIX 1: pass our own IP */
+                       const char *my_reachable_ip)
 {
     if (rows < 15)
     {
-        char lbl[128];
+        char lbl[160];
         snprintf(lbl, sizeof(lbl),
                  "Sending to rank %d (%d rows, subtree [%d..%d])",
                  target, rows, tree_start, tree_end);
         print_matrix(data, rows, cols, lbl);
     }
+
     int fd = connect_retry(ip[target], ports[target], 100);
+
     header_t h = {
         .num_rows = rows,
         .tree_start = tree_start,
@@ -279,9 +286,10 @@ static void send_chunk(int target,
         .global_min = global_min,
         .global_max = global_max,
     };
-    strncpy(h.parent_ip, sender_ip, sizeof(h.parent_ip) - 1);
+    strncpy(h.parent_ip, my_reachable_ip, sizeof(h.parent_ip) - 1);
 
-    if (sendv_all(fd, &h, sizeof(h), data, (size_t)rows * cols * sizeof(int)) < 0)
+    if (sendv_all(fd, &h, sizeof(h),
+                  data, (size_t)rows * cols * sizeof(int)) < 0)
     {
         fprintf(stderr, "send_chunk to rank %d failed\n", target);
         exit(1);
@@ -297,7 +305,7 @@ static void *send_chunk_worker(void *arg)
                j->ip, j->ports, j->cols,
                j->reply_port,
                j->global_min, j->global_max,
-               j->sender_ip); /* FIX 1 */
+               j->sender_ip);
     return NULL;
 }
 
@@ -321,7 +329,7 @@ static double *minmax_transform(const int *data, int rows, int cols,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Collect one child result on a pre-opened listener fd               */
+/*  Collect one child's assembled result                                */
 /* ------------------------------------------------------------------ */
 static void collect_one_result(int srv_fd, double *dst, int rows, int cols)
 {
@@ -332,6 +340,7 @@ static void collect_one_result(int srv_fd, double *dst, int rows, int cols)
         exit(1);
     }
     tune_socket(cli);
+
     result_header_t rh;
     if (recv_all(cli, &rh, sizeof(rh)) < 0)
     {
@@ -355,13 +364,12 @@ static void collect_one_result(int srv_fd, double *dst, int rows, int cols)
 /* ------------------------------------------------------------------ */
 /*  divide_and_scatter                                                  */
 /*                                                                      */
-/*  Combined scatter + local transform + gather in one recursive call. */
-/*  On return, assembled[0..total_rows*cols) holds the normalised rows */
-/*  for the entire subtree [tree_start..tree_end] in rank order.       */
-/*  Returns the number of rows this node kept locally.                  */
+/*  Recursively fans out rows to the right-half of our subtree,        */
+/*  transforms the left half locally, collects the right result, and   */
+/*  returns with assembled[] fully populated for [tree_start..tree_end]*/
 /*                                                                      */
-/*  FIX 1: my_ip is threaded through so intermediate nodes embed their */
-/*          own address in headers sent to children.                    */
+/*  my_reachable_ip: detected from the accepted incoming socket so     */
+/*  children know exactly which address to route results back to.      */
 /* ------------------------------------------------------------------ */
 static int divide_and_scatter(int *data,
                               int tree_start, int tree_end,
@@ -369,13 +377,13 @@ static int divide_and_scatter(int *data,
                               char ip[][64], int *ports, int cols,
                               double *assembled,
                               int global_min, int global_max,
-                              const char *my_ip)
+                              const char *my_reachable_ip)
 {
     int span = tree_end - tree_start + 1;
 
     if (span <= 1)
     {
-        /* Leaf node: transform all rows locally using the global scale */
+        /* Leaf: transform locally */
         double *t = minmax_transform(data, total_rows, cols,
                                      global_min, global_max);
         memcpy(assembled, t, (size_t)total_rows * cols * sizeof(double));
@@ -383,20 +391,15 @@ static int divide_and_scatter(int *data,
         return total_rows;
     }
 
-    /* Binary split */
     int mid = tree_start + span / 2;
     int right_nodes = tree_end - mid + 1;
     int right_rows = (int)((long long)total_rows * right_nodes / span);
     int left_rows = total_rows - right_rows;
 
-    /*
-     * Open the reply listener BEFORE spawning the thread so we know
-     * the port to embed in the header sent to the right child.
-     */
+    /* Open our reply listener before spawning the send thread */
     int right_reply_port;
     int right_srv = make_listener(&right_reply_port);
 
-    /* Send right half to mid slave (async), carrying our own IP */
     send_job_t rj = {
         .target = mid,
         .data = data + (size_t)left_rows * cols,
@@ -410,21 +413,23 @@ static int divide_and_scatter(int *data,
         .global_min = global_min,
         .global_max = global_max,
     };
-    strncpy(rj.sender_ip, my_ip, sizeof(rj.sender_ip) - 1);
+    strncpy(rj.sender_ip, my_reachable_ip, sizeof(rj.sender_ip) - 1);
 
     pthread_t rt;
     pthread_create(&rt, NULL, send_chunk_worker, &rj);
 
-    /* Recursively process left half – fills assembled[0..left_rows) */
-    int local_rows = divide_and_scatter(data, tree_start, mid - 1,
-                                        left_rows, ip, ports, cols,
+    /* Process left half recursively */
+    int local_rows = divide_and_scatter(data,
+                                        tree_start, mid - 1,
+                                        left_rows,
+                                        ip, ports, cols,
                                         assembled,
                                         global_min, global_max,
-                                        my_ip); /* FIX 1 */
+                                        my_reachable_ip);
 
     pthread_join(rt, NULL);
 
-    /* Collect right child's assembled result into assembled[left_rows..] */
+    /* Collect right child's result */
     collect_one_result(right_srv,
                        assembled + (size_t)left_rows * cols,
                        right_rows, cols);
@@ -434,8 +439,7 @@ static int divide_and_scatter(int *data,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Send result back to parent                                          */
-/*  FIX 1: caller passes hdr.parent_ip instead of hard-coded ip[0]    */
+/*  Send result back to the node that sent us work                      */
 /* ------------------------------------------------------------------ */
 static void send_result(const char *parent_ip, int reply_port,
                         const double *data, int rows, int cols)
@@ -480,19 +484,17 @@ int main(int argc, char *argv[])
         N++;
     fclose(fp);
 
-    /* Determine rank from port */
+    /* Determine rank from port (s==1 → slave, s==0 → master) */
     int rank = 0;
     if (s == 1)
     {
         rank = -1;
         for (int i = 1; i < N; i++)
-        {
             if (ports[i] == p)
             {
                 rank = i;
                 break;
             }
-        }
         if (rank < 0)
         {
             fprintf(stderr, "Error: port %d not found in config.txt\n", p);
@@ -500,8 +502,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* FIX 2: pin every process to a dedicated core right after startup */
-    pin_to_core(rank == 0 ? 0 : rank);
+    /* Pin to a dedicated core */
+    pin_to_core(rank);
 
     /* ==================== MASTER ================================== */
     if (rank == 0)
@@ -512,13 +514,13 @@ int main(int argc, char *argv[])
             perror("malloc M");
             return 1;
         }
+
         srand((unsigned)time(NULL));
         for (int i = 0; i < n * n; i++)
             M[i] = rand() % 100 + 1;
         if (n < 15)
             print_matrix(M, n, n, "MASTER: Initial Matrix");
 
-        /* Compute global min/max across the entire matrix */
         int global_min = M[0], global_max = M[0];
         for (int i = 1; i < n * n; i++)
         {
@@ -540,27 +542,22 @@ int main(int argc, char *argv[])
 
         if (N == 1)
         {
-            /*
-             * No slaves at all – master does the whole job locally.
-             */
             double *t = minmax_transform(M, n, n, global_min, global_max);
             memcpy(result, t, (size_t)n * n * sizeof(double));
             free(t);
         }
         else if (N == 2)
         {
-            /* Single slave */
             int reply_port;
             int reply_srv = make_listener(&reply_port);
             send_chunk(1, M, n, 1, 1, ip, ports, n,
                        reply_port, global_min, global_max,
-                       ip[0]); /* FIX 1: master passes its own IP */
+                       ip[0]);
             collect_one_result(reply_srv, result, n, n);
             close(reply_srv);
         }
         else
         {
-            /* N > 2: two subtrees */
             int slaves = N - 1;
             int mid = 1 + slaves / 2;
             int left_rows = (int)((long long)n * (mid - 1) / slaves);
@@ -583,7 +580,8 @@ int main(int argc, char *argv[])
                 .global_min = global_min,
                 .global_max = global_max,
             };
-            strncpy(lj.sender_ip, ip[0], sizeof(lj.sender_ip) - 1);
+            memcpy(lj.sender_ip, ip[0], sizeof(lj.sender_ip));
+            lj.sender_ip[sizeof(lj.sender_ip) - 1] = 0;
 
             send_job_t rj = {
                 .target = mid,
@@ -598,7 +596,8 @@ int main(int argc, char *argv[])
                 .global_min = global_min,
                 .global_max = global_max,
             };
-            strncpy(rj.sender_ip, ip[0], sizeof(rj.sender_ip) - 1);
+            memcpy(rj.sender_ip, ip[0], sizeof(rj.sender_ip));
+            rj.sender_ip[sizeof(rj.sender_ip) - 1] = 0;
 
             pthread_t lt, rt;
             pthread_create(&lt, NULL, send_chunk_worker, &lj);
@@ -606,19 +605,10 @@ int main(int argc, char *argv[])
             pthread_join(lt, NULL);
             pthread_join(rt, NULL);
 
-            /*
-             * FIX 3: collect both results sequentially on the pre-opened
-             *         listeners.  Children compute concurrently so order
-             *         doesn't matter for latency; we just drain both.
-             *
-             * FIX 4: the old separate ACK mechanism is REMOVED entirely.
-             *         The collect calls below are the implicit "done"
-             *         signal — when both returns the full tree is finished.
-             *         The racy epoll-ACK loop that could deadlock after
-             *         ack_srv was closed is gone.
-             */
-            collect_one_result(left_srv, result, left_rows, n);
-            collect_one_result(right_srv, result + (size_t)left_rows * n, right_rows, n);
+            collect_one_result(left_srv,
+                               result, left_rows, n);
+            collect_one_result(right_srv,
+                               result + (size_t)left_rows * n, right_rows, n);
             close(left_srv);
             close(right_srv);
         }
@@ -635,7 +625,6 @@ int main(int argc, char *argv[])
     /* ==================== SLAVE =================================== */
     else
     {
-        /* Listen for the scatter chunk from our parent */
         int srv = socket(AF_INET, SOCK_STREAM, 0);
         {
             int v = 1;
@@ -650,9 +639,21 @@ int main(int argc, char *argv[])
             bind(srv, (struct sockaddr *)&sa, sizeof(sa));
         }
         listen(srv, 5);
+
         int cli = accept(srv, NULL, NULL);
         tune_socket(cli);
         clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        /*
+         * KEY FIX: discover our own routable IP from the accepted socket.
+         * getsockname() on the accepted fd gives the real interface the
+         * kernel used — exactly what our parent (and our own children)
+         * can reach. We never trust ip[rank] from config.txt for this
+         * because it can be 0.0.0.0, wrong NIC, or an unresolvable name.
+         */
+        char my_reachable_ip[64] = "127.0.0.1";
+        local_ip_from_socket(cli, my_reachable_ip);
+        printf("SLAVE %d: my reachable IP = %s\n", rank, my_reachable_ip);
 
         header_t hdr;
         if (recv_all(cli, &hdr, sizeof(hdr)) < 0)
@@ -691,17 +692,14 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        /*
-         * FIX 1: pass ip[rank] (our own IP) so children know who to
-         *         reply to when we fan out further down the tree.
-         */
-        int local_rows = divide_and_scatter(data,
-                                            hdr.tree_start, hdr.tree_end,
-                                            hdr.num_rows,
-                                            ip, ports, n,
-                                            assembled,
-                                            hdr.global_min, hdr.global_max,
-                                            ip[rank]); /* FIX 1 */
+        int local_rows = divide_and_scatter(
+            data,
+            hdr.tree_start, hdr.tree_end,
+            hdr.num_rows,
+            ip, ports, n,
+            assembled,
+            hdr.global_min, hdr.global_max,
+            my_reachable_ip); /* ← the fix */
 
         if (n < 15)
         {
@@ -713,25 +711,17 @@ int main(int argc, char *argv[])
         }
 
         /*
-         * FIX 1: use hdr.parent_ip (whoever sent us the chunk) instead
-         *         of the hard-coded ip[0] (master).
+         * Reply to whoever sent us work: hdr.parent_ip + hdr.reply_port.
+         * This is the actual routable IP of our parent node, not ip[0].
          */
-        printf("SLAVE %d: Returning %d rows to parent %s:%d\n",
+        printf("SLAVE %d: returning %d rows → %s:%d\n",
                rank, hdr.num_rows, hdr.parent_ip, hdr.reply_port);
         send_result(hdr.parent_ip, hdr.reply_port,
                     assembled, hdr.num_rows, n);
 
-        /*
-         * FIX 4: ACK to master is REMOVED.  The master's result
-         *         collection already acts as the synchronisation barrier.
-         *         Keeping a separate ACK only introduced races when
-         *         ack_srv was closed before all late-arriving ACKs.
-         */
-
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        printf("SLAVE %d: Done. local_rows=%d, subtree [%d..%d]\n",
-               rank, local_rows, hdr.tree_start, hdr.tree_end);
-        printf("SLAVE %d time elapsed %f\n", rank,
+        printf("SLAVE %d: done. local_rows=%d subtree [%d..%d] time=%f\n",
+               rank, local_rows, hdr.tree_start, hdr.tree_end,
                (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
 
         free(assembled);
